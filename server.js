@@ -1,6 +1,7 @@
 // Load environment variables from .env file
-require('dotenv').config();
 
+require('dotenv').config();
+const ethers = require("ethers")
 const express = require('express');
 const multer = require('multer');
 const axios = require('axios');
@@ -10,12 +11,17 @@ const path = require('path');
 const stream = require('stream');
 const { promisify } = require('util');
 const pipeline = promisify(stream.pipeline);
-
+const archiver = require('archiver');
+const { v4: uuidv4 } = require('uuid');
 // Configuration
-const API_BASE_URL = process.env.API_BASE_URL || 'http://storage-service-url';
+const API_BASE_URL = process.env.API_BASE_URL;
 const PORT = process.env.PORT || 3001;
 const TEMP_DIR = './temp';
 const DEFAULT_BUCKET = 'bodyblueprintdao';
+const PRIVATE_KEY = process.env.PRIVATE_KEY;
+const DAO_ADDRESS = process.env.DAO_ADDRESS;
+const DAO_ABI  = process.env.DAO_ABI;
+const wallet = new ethers.Wallet(PRIVATE_KEY)
 
 // Create temp directory if it doesn't exist
 if (!fs.existsSync(TEMP_DIR)) {
@@ -37,6 +43,39 @@ const upload = multer({ storage });
 // Initialize Express app
 const app = express();
 app.use(express.json());
+
+
+/**
+ * Verify User is a member of the DAO
+ * @param {string} message   - Messaged that was signed
+ * @param {string} signature - Signed message
+ * @returns {Boolean} - Response from the DAO Contract
+ */
+async function isDAOMember(message,signature){
+  try {
+
+    const parsedMessage = JSON.parse(message)
+    const signedDate = new Date(parsedMessage.date).getTime();
+    const now = new Date().getTime()
+    if(Math.round(now-signedDate) > 5 )
+      return false
+
+    const contract = new ethers.Contract(DAO_ADDRESS,DAO_ABI,provider)
+    //const message = {message:"Body Blue Print DAO",date:new Date().toString()}
+
+    const recoveredAddress = ethers.utils.verifyMessage(message,signature)
+    console.log("Recovered Address: ",recoveredAddress)
+  
+    
+    const isMember = await contract.isMember(ethAddress);
+    return {isMember,recoveredAddress}
+
+  }catch(error)
+  {
+    return false
+  }
+}
+
 
 /**
  * Create a new bucket in the storage service
@@ -118,11 +157,14 @@ app.post('/api/buckets', async (req, res) => {
 
 // Upload file endpoint
 app.post('/api/buckets/:bucketName/upload', upload.single('file'), async (req, res) => {
-  const { bucketName } = req.params;
+  const { bucketName,message,signature } = req.params;
   const tempFilePath = req.file.path;
   const originalFilename = req.file.originalname;
   
   try {
+    const { isMember}= isDAOMember(message,signature)
+   // if(!isMember)
+     // throw(new Error("You are not a DAO Member"));
     const result = await uploadFileToStorage(bucketName, tempFilePath, originalFilename);
     
     // Clean up temp file
@@ -140,16 +182,18 @@ app.post('/api/buckets/:bucketName/upload', upload.single('file'), async (req, r
     
     console.error('Upload error:', error.message);
     res.status(error.response?.status || 500).json({
-      message: 'Failed to upload file',
-      error: error.response?.data || error.message
+      
+      error: error.message
     });
   }
 });
 
 // Download file endpoint
 app.get('/api/buckets/:bucketName/files/:fileName/download', async (req, res) => {
-  const { bucketName, fileName } = req.params;
-  
+  const { bucketName, fileName,message,signature } = req.params;
+  const { isMember}= isDAOMember(message,signature)
+    if(!isMember)
+    throw(new Error("You are not a DAO Member"));
   try {
     const fileStream = await downloadFileFromStorage(bucketName, fileName);
     
@@ -171,7 +215,7 @@ app.get('/api/buckets/:bucketName/files/:fileName/download', async (req, res) =>
 // List files in a bucket (optional, depends on if storage service supports this)
 app.get('/api/buckets/:bucketName/files', async (req, res) => {
   const { bucketName } = req.params;
-  
+ 
   try {
     const response = await axios.get(`${API_BASE_URL}/buckets/${bucketName}/files`);
     res.status(200).json(response.data);
@@ -206,6 +250,147 @@ async function initializeDefaultBucket() {
   }
 }
 
+
+app.get('/api/getzippeddata', async (req, res) => {
+  const { message, signature } = req.query;
+  const bucketName = DEFAULT_BUCKET; // Using the default bucket (bodyblueprintdao)
+  const requestId = uuidv4(); // Define requestId at the beginning
+  const requestTempDir = path.join(TEMP_DIR, requestId);
+  
+  try {
+    // Verify DAO membership if message and signature are provided
+    if (message && signature) {
+      const memberStatus = await isDAOMember(message, signature);
+      if (!memberStatus.isMember) {
+        return res.status(403).json({
+          message: 'Access denied: You are not a DAO member',
+          error: 'Authentication failed'
+        });
+      }
+    }
+    
+    // List all files in the bucket
+    const response = await axios.get(`${API_BASE_URL}/buckets/${bucketName}/files`);
+    
+    // Log the response to understand its structure
+    console.log('API Response Structure:', JSON.stringify(response.data, null, 2));
+    
+    // Extract files array - based on the specific response format shown
+    let files = [];
+    
+    // The API returns { success: true, data: [ {files...} ] }
+    if (response.data && response.data.success && Array.isArray(response.data.data)) {
+      files = response.data.data;
+    } else if (response.data && Array.isArray(response.data)) {
+      files = response.data;
+    } else if (response.data && Array.isArray(response.data.files)) {
+      files = response.data.files;
+    }
+    
+    console.log(`Found ${files.length} files to process`);
+    
+    if (!files.length) {
+      return res.status(404).json({
+        message: 'No files found in the bucket'
+      });
+    }
+    
+    // Create a unique temporary directory for this request
+    fs.mkdirSync(requestTempDir, { recursive: true });
+    
+    // Set up the response as a zip file
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="bodyblueprintdao-files.zip"`);
+    
+    // Create a zip archive
+    const archive = archiver('zip', {
+      zlib: { level: 9 } // Compression level
+    });
+    
+    // Pipe the archive to the response
+    archive.pipe(res);
+    
+    // Error handling for the archive
+    archive.on('error', (err) => {
+      console.error('Archive error:', err);
+      res.end();
+    });
+    
+    // Track downloaded files for cleanup
+    const downloadedFiles = [];
+    
+    // Process each file individually instead of using map
+    for (const file of files) {
+      // Extract filename from file object, specifically looking for the "Name" property (capital N)
+      const fileName = file.Name;
+      
+      if (!fileName) {
+        console.warn('Skipping file with no identifiable name:', file);
+        continue;
+      }
+      
+      console.log(`Processing file: ${fileName}`);
+      
+      try {
+        console.log(`Downloading file: ${fileName}`);
+        
+        // Download the file
+        const fileStream = await downloadFileFromStorage(bucketName, fileName);
+        const tempFilePath = path.join(requestTempDir, fileName);
+        
+        // Save the stream to a temporary file
+        await pipeline(fileStream, fs.createWriteStream(tempFilePath));
+        
+        // Add the file to the archive
+        archive.file(tempFilePath, { name: fileName });
+        
+        downloadedFiles.push(tempFilePath);
+      } catch (error) {
+        console.error(`Error downloading file ${fileName}:`, error.message);
+        // Continue with other files even if one fails
+      }
+    }
+    
+    // Finalize the archive
+    await archive.finalize();
+    
+    // Clean up the temporary files after response is sent
+    res.on('finish', () => {
+      // Delete all downloaded files
+      downloadedFiles.forEach(filePath => {
+        if (filePath && fs.existsSync(filePath)) {
+          fs.unlinkSync(filePath);
+        }
+      });
+      
+      // Remove the temporary directory
+      if (fs.existsSync(requestTempDir)) {
+        fs.rmdirSync(requestTempDir, { recursive: true });
+      }
+      
+      console.log(`Cleaned up temporary files for request ${requestId}`);
+    });
+    
+  } catch (error) {
+    console.error('Get zipped data error:', error.message);
+    
+    // If headers haven't been sent yet, send an error response
+    if (!res.headersSent) {
+      res.status(error.response?.status || 500).json({
+        message: 'Failed to get zipped data',
+        error: error.response?.data || error.message
+      });
+    } else {
+      // If headers were already sent, end the response
+      res.end();
+    }
+    
+    // Clean up any temporary directory created for this request
+    if (fs.existsSync(requestTempDir)) {
+      fs.rmdirSync(requestTempDir, { recursive: true });
+    }
+  }
+});
 // Start the server
 app.listen(PORT, async () => {
   console.log(`File relay server running on port ${PORT}`);
