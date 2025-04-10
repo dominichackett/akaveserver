@@ -13,6 +13,8 @@ const { promisify } = require('util');
 const pipeline = promisify(stream.pipeline);
 const archiver = require('archiver');
 const { v4: uuidv4 } = require('uuid');
+const cors = require('cors');
+
 // Configuration
 const API_BASE_URL = process.env.API_BASE_URL;
 const PORT = process.env.PORT || 3001;
@@ -21,8 +23,10 @@ const DEFAULT_BUCKET = 'bodyblueprintdao';
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const DAO_ADDRESS = process.env.DAO_ADDRESS;
 const DAO_ABI  = process.env.DAO_ABI;
-const wallet = new ethers.Wallet(PRIVATE_KEY)
+DAO_STORAGE_ABI =process.env.DAO_STORAGE_ABI
+DAO_STORAGE_ADDRESS = process.env.DAO_STORAGE_ADDRESS
 
+const provider = new ethers.providers.JsonRpcProvider(process.env.rpc);
 // Create temp directory if it doesn't exist
 if (!fs.existsSync(TEMP_DIR)) {
   fs.mkdirSync(TEMP_DIR, { recursive: true });
@@ -42,7 +46,55 @@ const upload = multer({ storage });
 
 // Initialize Express app
 const app = express();
+
+// Apply CORS middleware
+app.use(cors({
+  origin: '*', // Or specific origin like 'http://localhost:3000'
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
 app.use(express.json());
+/**
+ * Verify User is subscribed to the DAO to download data
+ * @param {string} message   - Messaged that was signed
+ * @param {string} signature - Signed message
+ * @returns {Boolean} - Response from the DAO Contract
+ */
+async function isSubscribedToDAO(message,signature){
+  let  recoveredAddress
+  let isSubscribed
+  try {
+
+    const parsedMessage = JSON.parse(message)
+    const signedDate = new Date(parsedMessage.date).getTime();
+    const now = new Date().getTime()
+    console.log(Math.round(now-signedDate)) 
+
+    if(Math.round(now-signedDate) > 5 * 60 * 1000 ) //5 minutes
+
+      {
+        console.log(Math.round(now-signedDate)) 
+        console.log("token expired")
+        return false
+      }
+
+    const contract = new ethers.Contract(DAO_STORAGE_ADDRESS,DAO_STORAGE_ABI,provider)
+    
+    recoveredAddress = ethers.utils.verifyMessage(message,signature)
+    console.log("Recovered Address: ",recoveredAddress)
+  
+    
+     isSubscribed = await contract.isSubscribed(recoveredAddress);
+     console.log(isSubscribed)
+    return {isSubscribed,recoveredAddress}
+
+  }catch(error)
+  {
+    console.log(error)
+    return {isSubscribed,recoveredAddress}
+  }
+}
 
 
 /**
@@ -52,27 +104,29 @@ app.use(express.json());
  * @returns {Boolean} - Response from the DAO Contract
  */
 async function isDAOMember(message,signature){
+  let  recoveredAddress
+  let  isMember 
   try {
 
     const parsedMessage = JSON.parse(message)
     const signedDate = new Date(parsedMessage.date).getTime();
     const now = new Date().getTime()
-    if(Math.round(now-signedDate) > 5 )
+    if(Math.round(now-signedDate) > 5 * 60 * 1000 )
       return false
 
     const contract = new ethers.Contract(DAO_ADDRESS,DAO_ABI,provider)
-    //const message = {message:"Body Blue Print DAO",date:new Date().toString()}
 
-    const recoveredAddress = ethers.utils.verifyMessage(message,signature)
+    recoveredAddress = ethers.utils.verifyMessage(message,signature)
     console.log("Recovered Address: ",recoveredAddress)
   
     
-    const isMember = await contract.isMember(ethAddress);
+    isMember = await contract.isMember(recoveredAddress);
     return {isMember,recoveredAddress}
 
   }catch(error)
   {
-    return false
+    return {isMember,recoveredAddress}
+
   }
 }
 
@@ -162,7 +216,7 @@ app.post('/api/buckets/:bucketName/upload', upload.single('file'), async (req, r
   const originalFilename = req.file.originalname;
   
   try {
-    const { isMember}= isDAOMember(message,signature)
+    const { isMember}= await isDAOMember(message,signature)
    // if(!isMember)
      // throw(new Error("You are not a DAO Member"));
     const result = await uploadFileToStorage(bucketName, tempFilePath, originalFilename);
@@ -191,7 +245,7 @@ app.post('/api/buckets/:bucketName/upload', upload.single('file'), async (req, r
 // Download file endpoint
 app.get('/api/buckets/:bucketName/files/:fileName/download', async (req, res) => {
   const { bucketName, fileName,message,signature } = req.params;
-  const { isMember}= isDAOMember(message,signature)
+  const { isMember}= await isDAOMember(message,signature)
     if(!isMember)
     throw(new Error("You are not a DAO Member"));
   try {
@@ -251,22 +305,23 @@ async function initializeDefaultBucket() {
 }
 
 
-app.get('/api/getzippeddata', async (req, res) => {
-  const { message, signature } = req.query;
+app.post('/api/getzippeddata', async (req, res) => {
+  const { message, signature } = req.body;
   const bucketName = DEFAULT_BUCKET; // Using the default bucket (bodyblueprintdao)
   const requestId = uuidv4(); // Define requestId at the beginning
   const requestTempDir = path.join(TEMP_DIR, requestId);
   
   try {
-    // Verify DAO membership if message and signature are provided
-    if (message && signature) {
-      const memberStatus = await isDAOMember(message, signature);
-      if (!memberStatus.isMember) {
+    // Verify Subscription
+      const {isSubscribed,recoveredAddress} = await  isSubscribedToDAO(message, signature);
+      console.log(isSubscribed)
+      console.log(recoveredAddress)
+      if (!isSubscribed) {
         return res.status(403).json({
-          message: 'Access denied: You are not a DAO member',
+          message: 'Access denied: You don\'t have a paid subscription.',
           error: 'Authentication failed'
         });
-      }
+      
     }
     
     // List all files in the bucket
